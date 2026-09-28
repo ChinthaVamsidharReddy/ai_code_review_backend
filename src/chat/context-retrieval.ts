@@ -26,6 +26,33 @@ const STOPWORDS = new Set([
  *  overview" answer instead of dragging in weakly-related file content. */
 const RELEVANCE_THRESHOLD = 4;
 
+/** Minimum length for two words to be compared by prefix rather than exact
+ *  match — below this, prefix comparison produces too many false
+ *  positives (e.g. "get" would "match" "gets", "getter", "getaway"). */
+const MIN_PREFIX_LEN = 4;
+
+function extractWords(text: string): string[] {
+  return text.toLowerCase().match(/[a-z0-9_]+/g) ?? [];
+}
+
+/** True for an exact match, or — for words long enough that it's a
+ *  meaningful signal rather than noise — when one word is a prefix of the
+ *  other. This is what lets a question asking about "authentication" match
+ *  code that says "AuthService" / "auth.service.ts": naive substring
+ *  matching (`haystack.includes(keyword)`) can't relate those, since
+ *  neither is a substring of the other — it can only find a shorter word
+ *  inside a longer piece of text, not recognize that "auth" is a
+ *  recognizable abbreviation of "authentication". Comparing extracted
+ *  whole words in both directions catches exactly this — the single most
+ *  common case, since code overwhelmingly abbreviates where prose doesn't. */
+function wordsMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (a.length >= MIN_PREFIX_LEN && b.length >= MIN_PREFIX_LEN) {
+    return a.startsWith(b) || b.startsWith(a);
+  }
+  return false;
+}
+
 /**
  * Simple, dependency-free relevance retrieval: scores each candidate file
  * by keyword overlap between the question and (a) its path/filename and
@@ -55,12 +82,14 @@ export function retrieveRelevantFiles(
   }
 
   const scored: ScoredFile[] = files.map(({ file, content }) => {
-    const haystack = `${file.relativePath.toLowerCase()}\n${content.toLowerCase()}`;
+    const pathWords = extractWords(file.relativePath);
+    const contentWords = extractWords(content);
     let score = 0;
+
     for (const kw of keywords) {
       // Filename/path matches weigh far more than a stray body match.
-      if (file.relativePath.toLowerCase().includes(kw)) score += 5;
-      const occurrences = haystack.split(kw).length - 1;
+      if (pathWords.some((w) => wordsMatch(w, kw))) score += 5;
+      const occurrences = contentWords.filter((w) => wordsMatch(w, kw)).length;
       score += Math.min(occurrences, 10); // cap so one huge file doesn't dominate
     }
     return { file, score };
