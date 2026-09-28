@@ -8,8 +8,9 @@ import { ListReviewsDto } from './dto/list-reviews.dto';
 import { FilesService } from '../files/files.service';
 import { AiProvidersService } from '../ai-providers/ai-providers.service';
 import { AiProviderError } from '../ai-providers/ai-client.interface';
-import { buildReviewContext, prioritizeFiles } from './context-builder';
+import { buildReviewContext, prioritizeFiles, allContentMissing, REVIEW_BUDGET_TIERS } from './context-builder';
 import { buildSystemPrompt, buildUserPrompt } from './review-templates';
+import { callWithResilience } from '../ai-providers/with-resilience';
 
 interface ParsedIssue {
   title: string;
@@ -51,26 +52,48 @@ export class ReviewsService {
         content: (await this.filesService.readFileText(projectId, f)) ?? '',
       })),
     );
-    const { files: contextFiles, skippedFileCount } = buildReviewContext(contentPairs);
+    if (allContentMissing(contentPairs)) {
+      throw new BadRequestException(
+        "This project's files are indexed but their stored content is missing on the server (the storage directory may not have been carried over during a redeploy/update). Re-upload the project's ZIP from the Code Explorer tab to restore it, then try again.",
+      );
+    }
 
     const scopeLabel = { single_file: 'single file', multi_file: 'selected files', project: 'entire project' }[dto.scope];
     const systemPrompt = buildSystemPrompt(dto.mode);
-    const userPrompt =
-      buildUserPrompt(contextFiles, scopeLabel) +
-      (skippedFileCount > 0
-        ? `\n\n(Note: ${skippedFileCount} additional file(s) were omitted to stay within context limits.)`
-        : '');
-
     const { client, config } = await this.aiProvidersService.resolveClient(userId, dto.providerId);
 
+    // Try the fullest context tier first, then progressively smaller ones —
+    // this is what makes reviews work reliably on small-context free-tier
+    // providers (e.g. Groq's free tier) without sacrificing breadth on
+    // providers that can actually handle a bigger request.
+    let lastContextFiles: ReturnType<typeof buildReviewContext>['files'] = [];
+    const attempts = REVIEW_BUDGET_TIERS.map((tier) => ({
+      label: tier.label,
+      run: async () => {
+        const { files: contextFiles, skippedFileCount } = buildReviewContext(contentPairs, tier);
+        lastContextFiles = contextFiles;
+        const userPrompt =
+          buildUserPrompt(contextFiles, scopeLabel) +
+          (skippedFileCount > 0
+            ? `\n\n(Note: ${skippedFileCount} additional file(s) were omitted to stay within context limits.)`
+            : '');
+        return client.chat(
+          [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          { jsonMode: true, temperature: 0.15, maxTokens: 1800 },
+        );
+      },
+    }));
+
     try {
-      const result = await client.chat(
-        [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        { jsonMode: true, temperature: 0.15, maxTokens: 4000 },
-      );
+      const { result, tierLabel } = await callWithResilience(attempts);
+      if (tierLabel !== REVIEW_BUDGET_TIERS[0].label) {
+        this.logger.warn(
+          `Review for project ${projectId} used the "${tierLabel}" context tier — the provider rejected larger context as too big.`,
+        );
+      }
 
       const parsed = this.parseAiOutput(result.content);
       const review = this.reviewRepo.create({
@@ -78,7 +101,7 @@ export class ReviewsService {
         requestedByUserId: userId,
         mode: dto.mode,
         scope: dto.scope,
-        filePaths: contextFiles.map((f) => f.path),
+        filePaths: lastContextFiles.map((f) => f.path),
         summary: parsed.summary,
         generalRecommendations: parsed.generalRecommendations ?? [],
         status: 'completed',
@@ -110,7 +133,7 @@ export class ReviewsService {
         requestedByUserId: userId,
         mode: dto.mode,
         scope: dto.scope,
-        filePaths: contextFiles.map((f) => f.path),
+        filePaths: lastContextFiles.map((f) => f.path),
         summary: '',
         generalRecommendations: [],
         status: 'failed',
@@ -213,7 +236,8 @@ export class ReviewsService {
       empty_response: 'The AI provider returned an empty response.',
       malformed_response: 'The AI provider returned a response that could not be parsed. Try again.',
       network: 'Could not reach the AI provider. Check the configured base URL.',
-      context_too_large: 'The selected code was too large for this provider/model. Try reviewing fewer files.',
+      context_too_large:
+        'Even the smallest context this app sends was too large for this provider/model. Try reviewing a single smaller file, or switch to a provider/model with a larger context window under AI Providers settings.',
       unknown: 'The AI provider returned an unexpected error.',
     };
     return messages[err.kind] ?? err.message;

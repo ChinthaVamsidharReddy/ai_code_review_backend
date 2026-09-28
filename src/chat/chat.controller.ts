@@ -35,7 +35,7 @@ export class ChatController {
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @Body() dto: AskQuestionDto,
   ) {
-    await this.projectsService.getOwnedProject(projectId, user.userId);
-    return this.chatService.ask(projectId, user.userId, dto);
+    const project = await this.projectsService.getOwnedProject(projectId, user.userId);
+    return this.chatService.ask(projectId, user.userId, dto, { name: project.name, description: project.description });
   }
 }

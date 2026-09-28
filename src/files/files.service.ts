@@ -140,15 +140,27 @@ export class FilesService {
     return root;
   }
 
-  async getFileContent(projectId: string, fileId: string): Promise<{ file: CodeFile; content: string | null }> {
+  async getFileContent(projectId: string, fileId: string): Promise<{ file: CodeFile; content: string | null; missing: boolean }> {
     const file = await this.repo.findOne({ where: { id: fileId, projectId } });
     if (!file) throw new NotFoundException('File not found');
-    if (file.isBinary) return { file, content: null };
+    if (file.isBinary) return { file, content: null, missing: false };
 
     const baseDir = this.projectDir(projectId);
     const fullPath = this.safeResolve(baseDir, file.relativePath);
-    const content = await fs.readFile(fullPath, 'utf-8').catch(() => null);
-    return { file, content };
+    try {
+      const content = await fs.readFile(fullPath, 'utf-8');
+      return { file, content, missing: false };
+    } catch {
+      // The database row exists (Postgres is a separate, persistent store)
+      // but the bytes aren't on disk under STORAGE_ROOT anymore — most
+      // commonly because the storage directory wasn't carried over when
+      // the backend's source files were updated/redeployed, or was cleared
+      // separately from the database. Distinguishing this from "binary"
+      // lets the frontend tell the user how to actually recover: re-upload
+      // the project's ZIP (uploads replace this project's file set,
+      // content included — see FilesService.ingestZip).
+      return { file, content: null, missing: true };
+    }
   }
 
   async getFilesByIds(projectId: string, fileIds: string[]): Promise<CodeFile[]> {

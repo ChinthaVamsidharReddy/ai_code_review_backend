@@ -58,15 +58,32 @@ export class OpenAiCompatibleClient implements AiClient {
     if (response.status === 413) {
       throw new AiProviderError('The request was too large for this provider/model', 'context_too_large');
     }
-    if (!response.ok) {
-      throw new AiProviderError(`AI provider returned HTTP ${response.status}`, 'unavailable');
-    }
 
     let json: any;
     try {
       json = await response.json();
     } catch {
+      if (!response.ok) {
+        throw new AiProviderError(`AI provider returned HTTP ${response.status}`, 'unavailable');
+      }
       throw new AiProviderError('AI provider returned a non-JSON response', 'malformed_response');
+    }
+
+    if (!response.ok) {
+      // Some OpenAI-compatible providers (Groq's API included, depending on
+      // model/version) report an oversized request as HTTP 400 with a
+      // descriptive error body rather than HTTP 413. Without this check,
+      // those get misclassified as a generic "unavailable" error and the
+      // resilience ladder never shrinks the context and retries — it just
+      // fails immediately on the first, largest attempt.
+      const bodyMessage: string = String(json?.error?.message ?? json?.message ?? '').toLowerCase();
+      const looksLikeContextOverflow =
+        response.status === 400 &&
+        /(context.?length|too (many|long)|reduce the length|maximum.*tokens|token limit)/.test(bodyMessage);
+      if (looksLikeContextOverflow) {
+        throw new AiProviderError(bodyMessage || 'The request was too large for this provider/model', 'context_too_large');
+      }
+      throw new AiProviderError(`AI provider returned HTTP ${response.status}`, 'unavailable');
     }
 
     const content: string | undefined = json?.choices?.[0]?.message?.content;

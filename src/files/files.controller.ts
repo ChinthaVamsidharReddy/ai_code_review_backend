@@ -27,6 +27,23 @@ export class FilesController {
   @UseInterceptors(
     FileInterceptor('file', {
       limits: { fileSize: 25 * 1024 * 1024 }, // 25MB archive ceiling
+      // Defense in depth alongside the filename check below: reject at the
+      // multer layer before the buffer is even fully accepted, by both
+      // extension and declared MIME type. Neither check alone is
+      // trustworthy (both are client-supplied and can be spoofed), which
+      // is exactly why FilesService.ingestZip() also validates the actual
+      // bytes via AdmZip — this just avoids doing that work for an obviously
+      // wrong upload.
+      fileFilter: (_req, file, callback) => {
+        const validExtension = file.originalname.toLowerCase().endsWith('.zip');
+        const validMimeType = ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'].includes(
+          file.mimetype,
+        );
+        if (!validExtension || !validMimeType) {
+          return callback(new BadRequestException('Only .zip archives are accepted'), false);
+        }
+        callback(null, true);
+      },
     }),
   )
   async uploadZip(
